@@ -17,7 +17,7 @@
  */
 
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -167,6 +167,42 @@ describe("CheckpointManager (integration)", () => {
 		});
 		const headSha = revResult.stdout.toString().trim();
 		expect(headSha).toBe(result?.commit);
+	}, 15_000);
+
+	it("skips nested dependency and generated directories", async () => {
+		writeFileSync(join(projectDir, "keep.ts"), "export const keep = true;\n");
+		for (const dir of ["packages/app/node_modules/pkg", "tools/.venv/lib", "src/__pycache__", "data/.cache"]) {
+			mkdirSync(join(projectDir, dir), { recursive: true });
+			writeFileSync(join(projectDir, dir, "large.dat"), "generated\n");
+		}
+
+		const mgr = new CheckpointManager(projectDir, tmpHome);
+		const result = await mgr.preToolSnapshot("write", "sess-excludes");
+
+		expect(result?.files).toContain("keep.ts");
+		expect(result?.files.some((file) => file.includes("node_modules"))).toBe(false);
+		expect(result?.files.some((file) => file.includes(".venv"))).toBe(false);
+		expect(result?.files.some((file) => file.includes("__pycache__"))).toBe(false);
+		expect(result?.files.some((file) => file.includes(".cache"))).toBe(false);
+	}, 15_000);
+
+	it("removes stale interrupted pack files", async () => {
+		const mgr = new CheckpointManager(projectDir, tmpHome);
+		await mgr.preToolSnapshot("write", "sess-pack-cleanup");
+
+		const packDir = join(shadowDirFor(projectDir, tmpHome), ".git", "objects", "pack");
+		mkdirSync(packDir, { recursive: true });
+		const stale = join(packDir, "tmp_pack_stale");
+		const fresh = join(packDir, "tmp_pack_fresh");
+		writeFileSync(stale, "stale");
+		writeFileSync(fresh, "fresh");
+		const oldTime = new Date(Date.now() - 11 * 60 * 1000);
+		utimesSync(stale, oldTime, oldTime);
+
+		await mgr.preToolSnapshot("write", "sess-pack-cleanup");
+
+		expect(existsSync(stale)).toBe(false);
+		expect(statSync(fresh).isFile()).toBe(true);
 	}, 15_000);
 
 	it("rollback 1 restores last write", async () => {

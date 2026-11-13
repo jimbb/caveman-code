@@ -17,9 +17,29 @@
  */
 
 import { type SpawnSyncReturns, spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, unlinkSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, statSync, unlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+
+const STALE_PACK_MS = 10 * 60 * 1000;
+const CHECKPOINT_EXCLUDES = [
+	":(exclude,glob)**/node_modules/**",
+	":(exclude,glob)**/.git/**",
+	":(exclude,glob)**/.venv/**",
+	":(exclude,glob)**/venv/**",
+	":(exclude,glob)**/env/**",
+	":(exclude,glob)**/__pycache__/**",
+	":(exclude,glob)**/.cache/**",
+	":(exclude,glob)**/.codex_tmp/**",
+	":(exclude,glob)**/target/**",
+	":(exclude,glob)**/dist/**",
+	":(exclude,glob)**/build/**",
+	":(exclude,glob)**/.next/**",
+	":(exclude,glob)**/.nuxt/**",
+	":(exclude,glob)**/.turbo/**",
+	":(exclude,glob)**/.gradle/**",
+	":(exclude,glob)**/coverage/**",
+] as const;
 
 export type SnapshotReason = "pre-write" | "pre-edit" | "pre-bash" | `manual:${string}`;
 
@@ -44,7 +64,7 @@ function gitShadow(
 	indexFile: string,
 	args: string[],
 ): SpawnSyncReturns<Buffer> {
-	return spawnSync("git", args, {
+	return spawnSync("git", ["-c", "gc.auto=0", ...args], {
 		cwd: projectRoot,
 		env: {
 			...process.env,
@@ -58,9 +78,29 @@ function gitShadow(
 	});
 }
 
+/** Remove pack files left behind by an interrupted git repack. */
+function cleanupStalePackFiles(shadowGitDir: string): void {
+	const packDir = join(shadowGitDir, "objects", "pack");
+	if (!existsSync(packDir)) return;
+
+	const cutoff = Date.now() - STALE_PACK_MS;
+	for (const name of readdirSync(packDir)) {
+		if (!name.startsWith("tmp_pack_") && !name.startsWith(".tmp-")) continue;
+		const file = join(packDir, name);
+		try {
+			if (statSync(file).mtimeMs < cutoff) unlinkSync(file);
+		} catch {
+			// Best effort: git may still be replacing this file.
+		}
+	}
+}
+
 /** Initialize the shadow bare repo if it does not already exist. */
 function ensureShadowRepo(shadowGitDir: string): void {
-	if (existsSync(join(shadowGitDir, "HEAD"))) return;
+	if (existsSync(join(shadowGitDir, "HEAD"))) {
+		cleanupStalePackFiles(shadowGitDir);
+		return;
+	}
 
 	const dir = join(shadowGitDir, "..");
 	if (!existsSync(dir)) {
@@ -75,6 +115,8 @@ function ensureShadowRepo(shadowGitDir: string): void {
 	if (result.status !== 0) {
 		throw new Error(`Failed to initialize shadow repo at ${shadowGitDir}: ${result.stderr?.toString() ?? "unknown"}`);
 	}
+
+	cleanupStalePackFiles(shadowGitDir);
 }
 
 /** Collect the list of tracked files after git add (for the index entry). */
@@ -117,13 +159,8 @@ export class Snapshotter {
 				"add",
 				"-A",
 				"--ignore-errors",
-				// Exclude common large dirs explicitly as a fast path even when no .gitignore
-				":(exclude)node_modules",
-				":(exclude).git",
-				":(exclude)dist",
-				":(exclude).next",
-				":(exclude).nuxt",
-				":(exclude)build",
+				// Exclude generated/dependency trees even when the project has no .gitignore.
+				...CHECKPOINT_EXCLUDES,
 			]);
 
 			if (addResult.status !== 0) {
@@ -164,6 +201,7 @@ export class Snapshotter {
 			const durationMs = Date.now() - t0;
 			return { commit, files, durationMs };
 		} finally {
+			cleanupStalePackFiles(this.shadowGitDir);
 			// Clean up temp index file
 			try {
 				if (existsSync(indexFile)) unlinkSync(indexFile);

@@ -4,6 +4,7 @@
 
 ### Fixed
 
+- Checkpoint snapshots now skip nested dependency and generated directories, disable automatic shadow-repo repacks, and clean up stale interrupted pack files.
 - Repomap `web-tree-sitter` loader now handles `Parser` named export, `default` export, and bare namespace shapes — fixes `TS2741: Property 'init' is missing` Windows build failure when `web-tree-sitter` is installed ([#13](https://github.com/JuliusBrussee/caveman-code/issues/13)).
 - Declared `web-tree-sitter` as an optional dependency so opting in to AST-backed repomap no longer requires a manual `npm install web-tree-sitter` step ([#13](https://github.com/JuliusBrussee/caveman-code/issues/13)).
 
